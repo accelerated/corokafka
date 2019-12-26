@@ -1,0 +1,70 @@
+language: cpp
+
+sudo: required
+
+compiler:
+  - g++
+  - clang
+
+os: linux
+
+dist: bionic
+
+addons:
+  apt:
+    update: true
+    sources:
+      - sourceline: 'ppa:mhier/libboost-latest'
+    packages:
+      - ninja-build
+      - libboost1.70-dev
+      - valgrind
+      - zookeeper
+      - zookeeperd
+      - googletest
+env:
+  - CXXSTANDARD=17
+  - KAFKA_VERSION=2.12-2.4.0
+  - RD_KAFKA_VERSION=v1.3.0
+
+before_script:
+  - wget http://mirror.metrocast.net/apache/kafka/2.4.0/kafka_$KAFKA_VERSION.tgz && tar -xvzf kafka_$KAFKA_VERSION.tgz
+  - ./kafka_$KAFKA_VERSION/bin/kafka-server-start.sh ./kafka_$KAFKA_VERSION/config/server.properties > /dev/null 2> /dev/null &
+  - while ! echo "asd" | nc localhost 9092; do sleep 1; done
+  - ./kafka_$KAFKA_VERSION/bin/kafka-topics.sh --create --zookeeper localhost:2181 --topic cppkafka_test1 --partitions 4 --replication-factor 1
+  - ./kafka_$KAFKA_VERSION/bin/kafka-topics.sh --create --zookeeper localhost:2181 --topic cppkafka_test2 --partitions 4 --replication-factor 1
+
+script:
+  - >
+  git clone https://github.com/edenhill/librdkafka.git --branch $RD_KAFKA_VERSION &&
+  cd librdkafka &&
+  cmake -DCMAKE_INSTALL_PREFIX=install -S . -G Ninja &&
+  ninja install;
+  cd ..
+
+  - >
+  git clone https://github.com/mfontanini/cppkafka.git &&
+  cd cppkafka &&
+  cmake -DCMAKE_INSTALL_PREFIX=install -S . -G Ninja &&
+  ninja install;
+  cd ..
+
+  - >
+  git clone https://github.com/bloomberg/quantum.git &&
+  cd quantum &&
+  cmake -DCMAKE_INSTALL_PREFIX=install -DQUANTUM_BOOST_USE_VALGRIND=ON -S . -G Ninja &&
+  ninja install;
+  cd ..
+
+  - >
+  cmake -DCMAKE_PREFIX_PATH=install
+        -DCOROKAFKA_CPPKAFKA_STATIC_LIB=ON
+        -DCOROKAFKA_RDKAFKA_STATIC_LIB=ON
+        -DCOROKAFKA_BOOST_STATIC_LIBS=ON
+        -DCOROKAFKA_ENABLE_PIC=ON
+        -DCOROKAFKA_ENABLE_TESTS=ON
+        -DCMAKE_BUILD_TYPE=Debug
+        -B build -S . -G Ninja &&
+  cd build &&
+  ninja CoroKafkaTests &&
+  ./tests/CoroKafkaTests.Linux;
