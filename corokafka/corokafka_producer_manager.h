@@ -49,6 +49,7 @@ public:
      * @param headers The header pack for this message in order of definition in the TopicTraits.
      * @param opaque An opaque data pointer which will be returned inside the delivery callback.
      * @return The number of bytes sent.
+     * @remark This call will block for the duration of the 'internal.producer.wait.for.acks.timeout.ms'.
      * @remark If the application uses *only* synchronous sends, better performance can be achieved by setting
      *         'internal.producer.payload.policy = passthrough', which will prevent the payload from being copied
      *         inside RdKafka.
@@ -73,11 +74,11 @@ public:
      * @param payload The message payload.
      * @param headers The header pack for this message.
      * @param opaque An opaque data pointer which will be returned inside the delivery callback or the returned future.
+     * @return A future containing a message delivery report.
      * @remark To guarantee strict message ordering, set 'internal.producer.preserve.message.order = true' which will
      *         also set the rdkafka option 'max.in.flight = 1' as it may cause re-ordering or packets.
      * @remark A message delivery can be tracked by registering a delivery report callback or by blocking on the
      *         returned future. Note that both these methods can be used jointly if needed.
-     * @return A future containing a message delivery report.
      * @warning This method will make an extra copy of the message.
      */
     template <typename TOPIC, typename K, typename P, typename ...H>
@@ -91,10 +92,21 @@ public:
     /**
      * @brief Wait for all pending 'posted' messages to be ack-ed by the broker.
      * @param topic The topic to wait for.
-     * @param timeout The maximum time to wait for. (==0 waits forever)
+     * @warning This function may throw. The time to wait is the internal producer specified time
+     *          'internal.producer.wait.for.acks.timeout.ms' or if not specified,
+     *          the 'internal.producer.timeout.ms'
      */
-    void waitForAcks(const std::string& topic,
-                     std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    void waitForAcks(const std::string& topic);
+    
+    /**
+     * @brief Wait for all pending 'posted' messages to be ack-ed by the broker.
+     * @param topic The topic to wait for.
+     * @param timeout The maximum time to wait for (-1 waits forever).
+     * @returns true if suceeded, false if timed-out before all the acks arrived.
+     * @warning This function may throw.
+     */
+    bool waitForAcks(const std::string& topic,
+                     std::chrono::milliseconds timeout);
     
     /**
      * @brief Gracefully shut down all producers and wait until all buffered messages are sent.
@@ -154,7 +166,7 @@ protected:
     virtual ~ProducerManager();
     
     void poll();
-    void post();
+    void pollEnd();
     
 private:
     std::unique_ptr<ProducerManagerImpl>  _impl;

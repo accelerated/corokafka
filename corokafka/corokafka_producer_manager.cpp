@@ -60,10 +60,15 @@ void ProducerManager::resetQueueFullTrigger(const std::string& topic)
     return _impl->resetQueueFullTrigger(topic);
 }
 
-void ProducerManager::waitForAcks(const std::string& topic,
+void ProducerManager::waitForAcks(const std::string& topic)
+{
+    _impl->waitForAcks(topic);
+}
+
+bool ProducerManager::waitForAcks(const std::string& topic,
                                   std::chrono::milliseconds timeout)
 {
-    _impl->waitForAcks(topic, timeout);
+    return _impl->waitForAcks(topic, timeout);
 }
 
 void ProducerManager::shutdown()
@@ -76,9 +81,9 @@ void ProducerManager::poll()
     _impl->poll();
 }
 
-void ProducerManager::post()
+void ProducerManager::pollEnd()
 {
-    _impl->post();
+    _impl->pollEnd();
 }
 
 void ProducerManager::enableMessageFanout(bool value)

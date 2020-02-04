@@ -76,14 +76,25 @@ private:
          P&& payload,
          H&&... headers);
     
-    void waitForAcks(const std::string& topic,
+    template <typename TOPIC, typename K, typename P, typename ...H>
+    quantum::GenericFuture<DeliveryReport>
+    postImpl(ExecMode mode,
+             const TOPIC& topic,
+             const void* opaque,
+             K&& key,
+             P&& payload,
+             H&&... headers);
+    
+    void waitForAcks(const std::string& topic);
+    
+    bool waitForAcks(const std::string& topic,
                      std::chrono::milliseconds timeout);
     
     void shutdown();
     
     void poll();
     
-    void post();
+    void pollEnd();
     
     void resetQueueFullTrigger(const std::string& topic);
     
@@ -100,7 +111,7 @@ private:
                                const std::string& reason);
     static void errorCallback(ProducerTopicEntry& topicEntry,
                                cppkafka::KafkaHandleBase& handle,
-                               int error,
+                               cppkafka::Error error,
                                const std::string& reason,
                                const void* sendOpaque);
     static void throttleCallback(ProducerTopicEntry& topicEntry,
@@ -131,7 +142,7 @@ private:
     //log + error callback wrapper
     static void report(ProducerTopicEntry& topicEntry,
                        cppkafka::LogLevel level,
-                       int error,
+                       cppkafka::Error error,
                        const std::string& reason,
                        const void* sendOpaque);
     
@@ -140,18 +151,10 @@ private:
     
     // Coroutines and async IO
     static int pollTask(ProducerTopicEntry& entry);
-    static int produceTask(ProducerTopicEntry& entry,
-                           ProducerMessageBuilder<ByteArray>&& builder);
-    static int produceTaskSync(ProducerTopicEntry& entry,
-                               const ProducerMessageBuilder<ByteArray>& builder);
-    template <typename TOPIC, typename K, typename P, typename ...H>
-    static BuilderTuple serializeCoro(quantum::VoidContextPtr ctx,
-                                      const TOPIC& topic,
-                                      ProducerTopicEntry& entry,
-                                      PackedOpaque* opaque,
-                                      K&& key,
-                                      P&& payload,
-                                      H&& ...headers);
+    template <typename BUILDER>
+    static int produceMessage(ExecMode mode,
+                              ProducerTopicEntry& entry,
+                              BUILDER&& builder);
     template <typename TOPIC, typename K, typename P, typename ...H>
     static ProducerMessageBuilder<ByteArray>
     serializeMessage(const TOPIC& topic,
@@ -161,8 +164,6 @@ private:
                      const P& payload,
                      const H&... headers);
     
-    static void produceMessage(const ProducerTopicEntry& topicEntry,
-                               const ProducerMessageBuilder<ByteArray>& builder);
     static void flush(const ProducerTopicEntry& topicEntry);
     
     // Misc methods
@@ -176,13 +177,15 @@ private:
     
     Producers::iterator findProducer(const std::string& topic);
     Producers::const_iterator findProducer(const std::string& topic) const;
+    static int32_t getPartition(const uint8_t* obj,
+                                size_t len,
+                                int32_t numPartitions);
+    static bool isFlushNonBlocking(const ProducerTopicEntry& topicEntry);
     
     // Members
     quantum::Dispatcher&        _dispatcher;
     Producers                   _producers;
     std::atomic_flag            _shutdownInitiated{0};
-    std::mutex                  _messageQueueMutex;
-    std::condition_variable     _emptyCondition;
     std::deque<MessageFuture>   _messageQueue;
     bool                        _messageFanout{false};
 };
@@ -243,7 +246,9 @@ ProducerManagerImpl::serializeMessage(const TOPIC& topic,
             failed = true;
             report(entry, cppkafka::LogLevel::LogErr, RD_KAFKA_RESP_ERR__KEY_SERIALIZATION, "Failed to serialize key", opaque);
         }
-        builder.key(std::move(b));
+        else {
+            builder.key(std::move(b));
+        }
     }
     catch (const std::exception& ex) {
         failed = true;
@@ -257,7 +262,9 @@ ProducerManagerImpl::serializeMessage(const TOPIC& topic,
             failed = true;
             report(entry, cppkafka::LogLevel::LogErr, RD_KAFKA_RESP_ERR__VALUE_SERIALIZATION, "Failed to serialize payload", opaque);
         }
-        builder.payload(std::move(b));
+        else {
+            builder.payload(std::move(b));
+        }
     }
     catch (const std::exception& ex) {
         failed = true;
@@ -287,40 +294,14 @@ ProducerManagerImpl::serializeMessage(const TOPIC& topic,
 }
 
 template <typename TOPIC, typename K, typename P, typename ...H>
-ProducerManagerImpl::BuilderTuple
-ProducerManagerImpl::serializeCoro(quantum::VoidContextPtr ctx,
-                                   const TOPIC& topic,
-                                   ProducerTopicEntry& entry,
-                                   PackedOpaque* opaque,
-                                   K&& key,
-                                   P&& payload,
-                                   H&& ...headers)
-{
-    return {&entry, serializeMessage(topic, entry, opaque, key, payload, headers...) };
-}
-
-template <typename TOPIC, typename K, typename P, typename ...H>
 size_t ProducerManagerImpl::send(const TOPIC& topic,
                                  const void* opaque,
                                  const K& key,
                                  const P& payload,
                                  const H&... headers)
 {
-    auto ctx = quantum::local::context();
-    if (ctx) {
-        return post(topic, opaque, key, payload, headers...).get().getNumBytesWritten();
-    }
-    ProducerTopicEntry& topicEntry = findProducer(topic.topic())->second;
-    ProducerMessageBuilder<ByteArray> builder = serializeMessage(topic, topicEntry, opaque, key, payload, headers...);
-    if (builder.topic().empty()) {
-        //Serializing failed
-        return 0;
-    }
-    builder.user_data(new PackedOpaque(opaque, quantum::Promise<DeliveryReport>()));
-    if (!builder.payload().empty()) {
-        produceMessage(topicEntry, builder); //blocks until delivery report is received
-    }
-    return builder.payload().size();
+    DeliveryReport rc = postImpl(ExecMode::Sync, topic, opaque, key, payload, headers...).get();
+    return rc.getError() ? 0 : rc.getNumBytesWritten();
 }
 
 template <typename TOPIC, typename K, typename P, typename ...H>
@@ -331,13 +312,18 @@ ProducerManagerImpl::post(const TOPIC& topic,
                           P&& payload,
                           H&&...headers)
 {
-    ProducerTopicEntry& topicEntry = findProducer(topic.topic())->second;
-    if (topicEntry._payloadPolicy == cppkafka::Producer::PayloadPolicy::PASSTHROUGH_PAYLOAD) {
-        throw ProducerException(topic.topic(), "Invalid async operation for pass-through payload policy - use send() instead.");
-    }
-    if (topicEntry._preserveMessageOrder && (topicEntry._producer->get_buffer_size() > topicEntry._maxQueueLength)) {
-        throw ProducerException(topic.topic(), "Internal queue full");
-    }
+    return postImpl(ExecMode::Async, topic, opaque, std::forward<K>(key), std::forward<P>(payload), std::forward<H>(headers)...);
+}
+
+template <typename TOPIC, typename K, typename P, typename ...H>
+quantum::GenericFuture<DeliveryReport>
+ProducerManagerImpl::postImpl(ExecMode mode,
+                              const TOPIC& topic,
+                              const void* opaque,
+                              K&& key,
+                              P&& payload,
+                              H&&...headers)
+{
     quantum::Promise<DeliveryReport> deliveryPromise;
     quantum::GenericFuture<DeliveryReport> deliveryFuture;
     auto ctx = quantum::local::context();
@@ -347,20 +333,73 @@ ProducerManagerImpl::post(const TOPIC& topic,
     else {
         deliveryFuture = deliveryPromise.getIThreadFuture();
     }
-    // Post the serialization future and return
-    {
-        std::unique_lock<std::mutex> lock(_messageQueueMutex);
-        _messageQueue.emplace_back(_dispatcher.post(
-                serializeCoro<TOPIC,K,P,H...>,
-                topic,
-                topicEntry,
-                new PackedOpaque(opaque, std::move(deliveryPromise)),
-                std::forward<K>(key),
-                std::forward<P>(payload),
-                std::forward<H>(headers)...));
+    ProducerTopicEntry& topicEntry = findProducer(topic.topic())->second;
+    if ((mode == ExecMode::Async) &&
+         topicEntry._preserveMessageOrder &&
+        (topicEntry._maxQueueLength > -1) &&
+        (topicEntry._producer->get_buffer_size() > topicEntry._maxQueueLength)) {
+        deliveryPromise.set(DeliveryReport{{}, 0, RD_KAFKA_RESP_ERR__QUEUE_FULL, opaque});
+        return deliveryFuture;
     }
-    _emptyCondition.notify_one();
+    ProducerMessageBuilder<ByteArray> builder = serializeMessage(topic, topicEntry, opaque, key, payload, headers...);
+    if (builder.topic().empty()) {
+        //Serializing failed
+        deliveryPromise.set(DeliveryReport{{}, 0, RD_KAFKA_RESP_ERR__VALUE_SERIALIZATION, opaque});
+    }
+    else {
+        builder.user_data(new PackedOpaque(opaque, std::move(deliveryPromise)));
+        if (ctx && (mode == ExecMode::Sync)) {
+            //Find thread id
+            int numThreads = topicEntry._syncProducerThreadRange.second-topicEntry._syncProducerThreadRange.first+1;
+            int threadId = getPartition(reinterpret_cast<const uint8_t*>(&key), sizeof(key), numThreads);
+            //Post this asynchronously and don't wait
+            ctx->postAsyncIo(threadId,
+                             false,
+                             produceMessage<ProducerMessageBuilder<ByteArray>>,
+                             ExecMode(mode),
+                             topicEntry,
+                             std::move(builder));
+        }
+        else {
+            produceMessage(mode, topicEntry, std::move(builder));
+        }
+    }
     return deliveryFuture;
+}
+
+template <typename BUILDER>
+int ProducerManagerImpl::produceMessage(ExecMode mode,
+                                        ProducerTopicEntry& entry,
+                                        BUILDER&& builder)
+{
+    try {
+        if (mode == ExecMode::Sync) {
+            if (entry._waitForAcksTimeout.count() == (int)TimerValues::Disabled) {
+                //sync produce using the default producer timeout
+                entry._producer->sync_produce(builder);
+            }
+            else {
+                //produce async and block until ack arrives or timeout
+                entry._producer->produce(builder);
+                entry._producer->wait_for_acks(entry._waitForAcksTimeout);
+            }
+        }
+        else {
+            //ExecMode::Async
+            if (entry._preserveMessageOrder) {
+                // Save to local buffer so we can flush synchronously later
+                entry._producer->add_message(std::forward<BUILDER>(builder));
+            }
+            else {
+                entry._producer->produce(builder);
+            }
+        }
+    }
+    catch (const std::exception& ex) {
+        exceptionHandler(ex, entry);
+        return -1;
+    }
+    return 0;
 }
  
 }}

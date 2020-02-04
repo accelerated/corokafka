@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <vector>
 #include <chrono>
+#include <atomic>
 
 //======================================================================================================================
 //                                               Disjunction port
@@ -107,7 +108,7 @@ ssize_t& maxMessageBuilderOutputLength();
 
 struct Interruptible
 {
-    bool _shuttingDown{false};
+    std::atomic<bool> _shuttingDown{false};
 };
 
 void handleException(const std::exception &ex,

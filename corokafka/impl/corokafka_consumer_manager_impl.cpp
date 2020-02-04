@@ -85,24 +85,25 @@ ConsumerManagerImpl::~ConsumerManagerImpl()
 
 void ConsumerManagerImpl::setup(const std::string& topic, ConsumerTopicEntry& topicEntry)
 {
-    const Configuration::OptionList& rdKafkaOptions = topicEntry._configuration.getOptions(Configuration::OptionType::RdKafka);
-    const Configuration::OptionList& rdKafkaTopicOptions = topicEntry._configuration.getTopicOptions(Configuration::OptionType::RdKafka);
-    const Configuration::OptionList& internalOptions = topicEntry._configuration.getOptions(Configuration::OptionType::Internal);
+    const Configuration::OptionList &rdKafkaOptions = topicEntry._configuration
+                                                                .getOptions(Configuration::OptionType::RdKafka);
+    const Configuration::OptionList &rdKafkaTopicOptions = topicEntry._configuration
+                                                                     .getTopicOptions(Configuration::OptionType::RdKafka);
+    const Configuration::OptionList &internalOptions = topicEntry._configuration
+                                                                 .getOptions(Configuration::OptionType::Internal);
     
-    auto extract = [&topic, &internalOptions](const std::string& name, auto& value)->bool {
+    auto extract = [&topic, &internalOptions](const std::string &name, auto &value) -> bool
+    {
         return ConsumerConfiguration::extract(name)(topic, Configuration::findOption(name, internalOptions), &value);
     };
     
     //Validate config
-    const cppkafka::ConfigurationOption* brokerList =
-        Configuration::findOption(Configuration::RdKafkaOptions::metadataBrokerList, rdKafkaOptions);
-    if (!brokerList) {
+    std::string brokerList;
+    if (!topicEntry._configuration.getOption(Configuration::RdKafkaOptions::metadataBrokerList)) {
         throw InvalidOptionException(topic, Configuration::RdKafkaOptions::metadataBrokerList, "Missing");
     }
     
-    const cppkafka::ConfigurationOption* groupId =
-        Configuration::findOption(Configuration::RdKafkaOptions::groupId, rdKafkaOptions);
-    if (!groupId) {
+    if (!topicEntry._configuration.getOption(Configuration::RdKafkaOptions::groupId)) {
         throw InvalidOptionException(topic, Configuration::RdKafkaOptions::groupId, "Missing");
     }
     
@@ -138,7 +139,7 @@ void ConsumerManagerImpl::setup(const std::string& topic, ConsumerTopicEntry& to
     }
     
     if (topicEntry._configuration.getOffsetCommitCallback()) {
-        auto offsetCommitFunc = std::bind(offsetCommitCallback, std::ref(topicEntry), _1,  _2, _3);
+        auto offsetCommitFunc = std::bind(offsetCommitCallback, std::ref(topicEntry), _1, _2, _3);
         kafkaConfig.set_offset_commit_callback(std::move(offsetCommitFunc));
     }
     
@@ -194,20 +195,14 @@ void ConsumerManagerImpl::setup(const std::string& topic, ConsumerTopicEntry& to
     topicEntry._consumer.reset(new cppkafka::Consumer(kafkaConfig));
     topicEntry._committer.reset(new cppkafka::BackoffCommitter(*topicEntry._consumer));
     
+    //Get events queue for polling
+    topicEntry._eventQueue = topicEntry._consumer->get_main_queue();
+    
     auto offsetCommitErrorFunc = std::bind(&offsetCommitErrorCallback, std::ref(topicEntry), _1);
     topicEntry._committer->set_error_callback(offsetCommitErrorFunc);
     
     //Set internal config options
     extract(ConsumerConfiguration::Options::skipUnknownHeaders, topicEntry._skipUnknownHeaders);
-    
-    std::chrono::milliseconds timeout;
-    if (extract(ConsumerConfiguration::Options::timeoutMs, timeout)) {
-        topicEntry._consumer->set_timeout(timeout);
-    }
-    
-    extract(ConsumerConfiguration::Options::pollTimeoutMs, topicEntry._pollTimeout);
-    
-    extract(ConsumerConfiguration::Options::roundRobinMinPollTimeoutMs, topicEntry._roundRobinMinPollTimeout);
     
     if (extract(ConsumerConfiguration::Options::logLevel, topicEntry._logLevel)) {
         topicEntry._consumer->set_log_level(topicEntry._logLevel);
@@ -253,15 +248,20 @@ void ConsumerManagerImpl::setup(const std::string& topic, ConsumerTopicEntry& to
     extract(ConsumerConfiguration::Options::receiveCallbackExec, topicEntry._receiveCallbackExec);
     
     extract(ConsumerConfiguration::Options::receiveInvokeThread, topicEntry._receiverThread);
-    if (topicEntry._receiverThread == ThreadType::Coro) {
-        topicEntry._receiveCallbackExec = ExecMode::Sync; //override user setting
-    }
 
     extract(ConsumerConfiguration::Options::batchPrefetch, topicEntry._batchPrefetch);
     
     extract(ConsumerConfiguration::Options::preprocessMessages, topicEntry._preprocess);
     
-    extract(ConsumerConfiguration::Options::preprocessInvokeThread, topicEntry._preprocessorThread);
+    extract(ConsumerConfiguration::Options::pollIoThreadId, topicEntry._pollIoThreadId);
+    if ((int)topicEntry._pollIoThreadId >= _dispatcher.getNumIoThreads()) {
+        throw InvalidOptionException(topic, ConsumerConfiguration::Options::pollIoThreadId, "Value is out of bounds");
+    }
+    
+    extract(ConsumerConfiguration::Options::processCoroThreadId, topicEntry._processCoroThreadId);
+    if ((int)topicEntry._processCoroThreadId >= _dispatcher.getNumCoroutineThreads()) {
+        throw InvalidOptionException(topic, ConsumerConfiguration::Options::processCoroThreadId, "Value is out of bounds");
+    }
     
     // Set the consumer callbacks
     if (topicEntry._configuration.getRebalanceCallback() ||
@@ -284,33 +284,25 @@ void ConsumerManagerImpl::setup(const std::string& topic, ConsumerTopicEntry& to
         }
     }
     
-    //subscribe or statically assign partitions to this consumer
-    if (topicEntry._configuration.getPartitionStrategy() == PartitionStrategy::Static) {
-        if ((topicEntry._configuration.getInitialPartitionAssignment().size() == 1) &&
-            (topicEntry._configuration.getInitialPartitionAssignment().front().get_partition() == RD_KAFKA_PARTITION_UA)) {
-            //assign all partitions belonging to this topic
-            cppkafka::TopicMetadata metadata = topicEntry._consumer->get_metadata(topicEntry._consumer->get_topic(topic));
-            cppkafka::TopicPartitionList partitions = cppkafka::convert(topic, metadata.get_partitions());
-            //set the specified offset on all partitions
-            for (auto& p : partitions) {
-                p.set_offset(topicEntry._configuration.getInitialPartitionAssignment().front().get_offset());
-            }
-            topicEntry._consumer->assign(partitions);
-        }
-        else {
-            topicEntry._consumer->assign(topicEntry._configuration.getInitialPartitionAssignment());
-        }
-    }
-    else {
-        topicEntry._consumer->subscribe({topic});
-    }
-    
     PollStrategy pollStrategy = PollStrategy::Batch;
     extract(ConsumerConfiguration::Options::pollStrategy, pollStrategy);
     if (pollStrategy == PollStrategy::RoundRobin) {
-        //This needs to be created after the partitions are assigned to the consumer
-        topicEntry._roundRobin.reset(new cppkafka::RoundRobinPollStrategy(*topicEntry._consumer));
+        topicEntry._roundRobinStrategy.reset(new cppkafka::RoundRobinPollStrategy(*topicEntry._consumer));
     }
+    
+    //dynamically subscribe or statically assign partitions to this consumer
+    subscribe(topic, topicEntry, {});
+    
+    //This must come *after* pausing the consumer and assigning partitions.
+    // If the timeout is too small, these operations may throw an exception.
+    std::chrono::milliseconds timeout;
+    if (extract(ConsumerConfiguration::Options::timeoutMs, timeout)) {
+        topicEntry._consumer->set_timeout(timeout);
+    }
+    
+    extract(ConsumerConfiguration::Options::pollTimeoutMs, topicEntry._pollTimeout);
+    
+    extract(ConsumerConfiguration::Options::minRoundRobinPollTimeoutMs, topicEntry._minRoundRobinPollTimeout);
 }
 
 ConsumerMetadata ConsumerManagerImpl::getMetadata(const std::string& topic)
@@ -335,17 +327,18 @@ void ConsumerManagerImpl::pause(const std::string& topic)
 {
     if (topic.empty()) {
         for (auto&& consumer : _consumers) {
+            ConsumerTopicEntry& topicEntry = consumer.second;
             bool paused = false;
-            if (consumer.second._isPaused.compare_exchange_strong(paused, !paused)) {
-                consumer.second._consumer->pause();
+            if (topicEntry._isPaused.compare_exchange_strong(paused, !paused)) {
+                topicEntry._consumer->pause();
             }
         }
     }
     else {
         bool paused = false;
-        ConsumerTopicEntry& consumerTopicEntry = findConsumer(topic)->second;
-        if (consumerTopicEntry._isPaused.compare_exchange_strong(paused, !paused)) {
-            consumerTopicEntry._consumer->pause();
+        ConsumerTopicEntry& topicEntry = findConsumer(topic)->second;
+        if (topicEntry._isPaused.compare_exchange_strong(paused, !paused)) {
+            topicEntry._consumer->pause();
         }
     }
 }
@@ -354,45 +347,87 @@ void ConsumerManagerImpl::resume(const std::string& topic)
 {
     if (topic.empty()) {
         for (auto&& consumer : _consumers) {
+            ConsumerTopicEntry& topicEntry = consumer.second;
             bool paused = true;
-            if (consumer.second._isPaused.compare_exchange_strong(paused, !paused)) {
-                consumer.second._consumer->resume();
+            if (topicEntry._isPaused.compare_exchange_strong(paused, !paused)) {
+                topicEntry._consumer->resume();
             }
         }
     }
     else {
         bool paused = true;
-        ConsumerTopicEntry& consumerTopicEntry = findConsumer(topic)->second;
-        if (consumerTopicEntry._isPaused.compare_exchange_strong(paused, !paused)) {
-            consumerTopicEntry._consumer->resume();
+        ConsumerTopicEntry& topicEntry = findConsumer(topic)->second;
+        if (topicEntry._isPaused.compare_exchange_strong(paused, !paused)) {
+            topicEntry._consumer->resume();
         }
     }
 }
 
 void ConsumerManagerImpl::subscribe(const std::string& topic,
-                                    cppkafka::TopicPartitionList partitionList)
+                                    ConsumerTopicEntry& topicEntry,
+                                    const cppkafka::TopicPartitionList& partitionList)
 {
-    ConsumerTopicEntry& topicEntry = findConsumer(topic)->second;
     if (topicEntry._isSubscribed) {
         throw ConsumerException(topic, "Already subscribed");
     }
-    //subscribe or statically assign partitions to this consumer
-    topicEntry._isSubscribed = true;
-    topicEntry._setOffsetsOnStart = true;
-    if (!partitionList.empty()) {
-        //Overwrite the initial assignment
-        topicEntry._configuration.assignInitialPartitions(topicEntry._configuration.getPartitionStrategy(),
-                                                          std::move(partitionList));
-    }
-    if (topicEntry._configuration.getPartitionStrategy() == PartitionStrategy::Static) {
-        cppkafka::TopicPartitionList partitions = topicEntry._configuration.getInitialPartitionAssignment();
-        for (auto& partition : partitions) {
-            partition.set_offset(RD_KAFKA_OFFSET_STORED);
+    //process partitions and make sure offsets are valid
+    cppkafka::TopicPartitionList assignment = partitionList;
+    if ((assignment.size() == 1) &&
+        (assignment.front().get_partition() == RD_KAFKA_PARTITION_UA)) {
+        //Overwrite the initial assignment if the user provided no partitions
+        cppkafka::TopicMetadata metadata = topicEntry._consumer->get_metadata(topicEntry._consumer->get_topic(topic));
+        int offset = assignment.front().get_offset();
+        assignment = cppkafka::convert(topic, metadata.get_partitions());
+        //set the specified offset on all existing partitions
+        for (auto& partition : assignment) {
+            partition.set_offset(offset);
         }
-        topicEntry._consumer->assign(partitions);
+    }
+    if (assignment.empty()) {
+        //use updated current assignment
+        assignment = topicEntry._partitionAssignment;
+    }
+    //assign or subscribe
+    if (topicEntry._configuration.getPartitionStrategy() == PartitionStrategy::Static) {
+        if (assignment.empty()) {
+            //we must have valid partitions
+            throw ConsumerException(topic, "Empty partition assignment");
+        }
+        if (topicEntry._roundRobinStrategy) {
+            topicEntry._roundRobinStrategy->assign(assignment);
+        }
+        //invoke the assignment callback manually
+        ConsumerManagerImpl::assignmentCallback(topicEntry, assignment);
+        topicEntry._consumer->assign(assignment);
+    }
+    else { //Dynamic strategy
+        if (!assignment.empty()) {
+            topicEntry._setOffsetsOnStart = true;
+            //overwrite original if any so that offsets may be used when the assignment callback is invoked
+            topicEntry._partitionAssignment = assignment;
+        }
+        topicEntry._consumer->subscribe({topic});
+    }
+}
+
+void ConsumerManagerImpl::subscribe(const std::string& topic,
+                                    const cppkafka::TopicPartitionList& partitionList)
+{
+    if (topic.empty()) {
+        for (auto&& consumer : _consumers) {
+            if (!consumer.second._isSubscribed) {
+                subscribe(consumer.first, consumer.second, partitionList);
+            }
+        }
     }
     else {
-        topicEntry._consumer->subscribe({topic});
+        ConsumerTopicEntry& topicEntry = findConsumer(topic)->second;
+        if (!topicEntry._isSubscribed) {
+            subscribe(topic, topicEntry, partitionList);
+        }
+        else {
+            throw ConsumerException(topic, "Consumer already subscribed");
+        }
     }
 }
 
@@ -400,25 +435,35 @@ void ConsumerManagerImpl::unsubscribe(const std::string& topic)
 {
     if (topic.empty()) {
         for (auto&& consumer : _consumers) {
-            if (consumer.second._isSubscribed) {
-                if (consumer.second._configuration.getPartitionStrategy() == PartitionStrategy::Static) {
-                    consumer.second._consumer->unassign();
+            ConsumerTopicEntry& topicEntry = consumer.second;
+            if (topicEntry._isSubscribed) {
+                if (topicEntry._configuration.getPartitionStrategy() == PartitionStrategy::Static) {
+                    if (topicEntry._roundRobinStrategy) {
+                        topicEntry._roundRobinStrategy->revoke();
+                    }
+                    //invoke the revocation callback manually
+                    ConsumerManagerImpl::revocationCallback(topicEntry, consumer.second._consumer->get_assignment());
+                    topicEntry._consumer->unassign();
                 }
                 else {
-                    consumer.second._consumer->unsubscribe();
+                    topicEntry._consumer->unsubscribe();
                 }
-                consumer.second._isSubscribed = false;
             }
         }
     }
     else {
-        ConsumerTopicEntry& consumerTopicEntry = findConsumer(topic)->second;
-        if (consumerTopicEntry._isSubscribed) {
-            if (consumerTopicEntry._configuration.getPartitionStrategy() == PartitionStrategy::Static) {
-                consumerTopicEntry._consumer->unassign();
+        ConsumerTopicEntry& topicEntry = findConsumer(topic)->second;
+        if (topicEntry._isSubscribed) {
+            if (topicEntry._configuration.getPartitionStrategy() == PartitionStrategy::Static) {
+                if (topicEntry._roundRobinStrategy) {
+                    topicEntry._roundRobinStrategy->revoke();
+                }
+                //invoke the revocation callback manually
+                ConsumerManagerImpl::revocationCallback(topicEntry, topicEntry._consumer->get_assignment());
+                topicEntry._consumer->unassign();
             }
             else {
-                consumerTopicEntry._consumer->unsubscribe();
+                topicEntry._consumer->unsubscribe();
             }
         }
     }
@@ -523,25 +568,43 @@ void ConsumerManagerImpl::poll()
 {
     auto now = std::chrono::steady_clock::now();
     for (auto&& entry : _consumers) {
-        if (!entry.second._isSubscribed) {
-            continue; //we are no longer subscribed here
+        if (_shuttingDown) {
+            entry.second._shuttingDown = true;
+            continue;
         }
         // Adjust throttling if necessary
         adjustThrottling(entry.second, now);
-        bool doPoll = !entry.second._pollFuture || (entry.second._pollFuture->waitFor(std::chrono::milliseconds(0)) == std::future_status::ready);
-        if (doPoll) {
-            // Round-robin
-            if (entry.second._roundRobin) {
-                entry.second._pollFuture =
-                    _dispatcher.postFirst((int)quantum::IQueue::QueueId::Any, true, pollCoro, entry.second)->
-                                then(processorCoro, entry.second)->
-                                end();
+        
+        // Poll for events
+        entry.second._eventQueue.consume(std::chrono::milliseconds::zero());
+        
+        // Poll for messages
+        bool pollMessages = !entry.second._pollFuture ||
+                            (entry.second._pollFuture->waitFor(std::chrono::milliseconds::zero()) == std::future_status::ready);
+        if (pollMessages) {
+            // Check if we have any new messages
+            if (hasNewMessages(entry.second)) {
+                // Round-robin
+                if (entry.second._roundRobinStrategy) {
+                    entry.second._pollFuture =
+                        _dispatcher.post((int)entry.second._processCoroThreadId, true, pollCoro, entry.second);
+                }
+                else {
+                    // Batch
+                    entry.second._pollFuture =
+                      _dispatcher.post((int)entry.second._processCoroThreadId, true, pollBatchCoro, entry.second);
+                }
             }
-            else {
-                // Batch
-                entry.second._pollFuture =
-                  _dispatcher.post((int)quantum::IQueue::QueueId::Any, true, pollBatchCoro, entry.second);
-            }
+        }
+    }
+}
+
+void ConsumerManagerImpl::pollEnd()
+{
+    for (auto&& entry : _consumers) {
+        if (entry.second._pollFuture) {
+            //wait until poll task has completed
+            entry.second._pollFuture->get();
         }
     }
 }
@@ -552,13 +615,13 @@ void ConsumerManagerImpl::errorCallback2(
                         int error,
                         const std::string& reason)
 {
-    errorCallback(topicEntry, handle, error, reason, nullptr);
+    errorCallback(topicEntry, handle, (rd_kafka_resp_err_t)error, reason, nullptr);
 }
 
 void ConsumerManagerImpl::errorCallback(
                         ConsumerTopicEntry& topicEntry,
                         cppkafka::KafkaHandleBase& handle,
-                        int error,
+                        cppkafka::Error error,
                         const std::string& reason,
                         const cppkafka::Message* message)
 {
@@ -566,7 +629,7 @@ void ConsumerManagerImpl::errorCallback(
                               topicEntry._configuration.getErrorCallbackOpaque() : message;
     cppkafka::CallbackInvoker<Callbacks::ErrorCallback>
         ("error", topicEntry._configuration.getErrorCallback(), &handle)
-            (makeMetadata(topicEntry), cppkafka::Error((rd_kafka_resp_err_t)error), reason, const_cast<void*>(errorOpaque));
+            (makeMetadata(topicEntry), error, reason, const_cast<void*>(errorOpaque));
 }
 
 void ConsumerManagerImpl::throttleCallback(
@@ -641,7 +704,7 @@ bool ConsumerManagerImpl::offsetCommitErrorCallback(
                         ConsumerTopicEntry& topicEntry,
                         cppkafka::Error error)
 {
-    report(topicEntry, cppkafka::LogLevel::LogErr, error.get_error(), "Failed to commit offset.", nullptr);
+    report(topicEntry, cppkafka::LogLevel::LogErr, error, "Failed to commit offset.", nullptr);
     return ((error.get_error() != RD_KAFKA_RESP_ERR_OFFSET_OUT_OF_RANGE) &&
             (error.get_error() != RD_KAFKA_RESP_ERR_OFFSET_METADATA_TOO_LARGE) &&
             (error.get_error() != RD_KAFKA_RESP_ERR_INVALID_COMMIT_OFFSET_SIZE));
@@ -649,12 +712,12 @@ bool ConsumerManagerImpl::offsetCommitErrorCallback(
 
 bool ConsumerManagerImpl::preprocessorCallback(
                         ConsumerTopicEntry& topicEntry,
-                        cppkafka::TopicPartition hint)
+                        const cppkafka::Message& rawMessage)
 {
     // Check if we have opaque data
     return cppkafka::CallbackInvoker<Callbacks::PreprocessorCallback>
         ("preprocessor", topicEntry._configuration.getPreprocessorCallback(), topicEntry._consumer.get())
-            (hint);
+            (rawMessage);
 }
 
 void ConsumerManagerImpl::assignmentCallback(
@@ -666,7 +729,7 @@ void ConsumerManagerImpl::assignmentCallback(
     topicEntry._throttleControl.reset();
     PartitionStrategy strategy = topicEntry._configuration.getPartitionStrategy();
     if ((strategy == PartitionStrategy::Dynamic) &&
-        !topicEntry._configuration.getInitialPartitionAssignment().empty() &&
+        !topicEntry._partitionAssignment.empty() &&
         topicEntry._setOffsetsOnStart) {
         topicEntry._setOffsetsOnStart = false;
         //perform first offset assignment based on user config
@@ -680,7 +743,7 @@ void ConsumerManagerImpl::assignmentCallback(
             }
         }
     }
-    topicEntry._configuration.assignInitialPartitions(strategy, topicPartitions); //overwrite original if any
+    topicEntry._partitionAssignment = topicPartitions; //overwrite original if any
     cppkafka::CallbackInvoker<Callbacks::RebalanceCallback>
         ("assignment", topicEntry._configuration.getRebalanceCallback(), topicEntry._consumer.get())
             (makeMetadata(topicEntry), cppkafka::Error(RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS), topicPartitions);
@@ -692,7 +755,8 @@ void ConsumerManagerImpl::revocationCallback(
 {
     topicEntry._isSubscribed = false;
     PartitionStrategy strategy = topicEntry._configuration.getPartitionStrategy();
-    topicEntry._configuration.assignInitialPartitions(strategy, {}); //clear assignment
+    topicEntry._partitionAssignment.clear(); //clear assignment
+    topicEntry._watermarks.clear(); //clear offset watermarks
     cppkafka::CallbackInvoker<Callbacks::RebalanceCallback>
         ("revocation", topicEntry._configuration.getRebalanceCallback(), topicEntry._consumer.get())
             (makeMetadata(topicEntry), cppkafka::Error(RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS), const_cast<cppkafka::TopicPartitionList&>(topicPartitions));
@@ -702,10 +766,14 @@ void ConsumerManagerImpl::rebalanceErrorCallback(
                         ConsumerTopicEntry& topicEntry,
                         cppkafka::Error error)
 {
-    cppkafka::TopicPartitionList partitions;
+    topicEntry._isSubscribed = false;
+    PartitionStrategy strategy = topicEntry._configuration.getPartitionStrategy();
+    topicEntry._partitionAssignment.clear(); //clear assignment
+    topicEntry._watermarks.clear(); //clear offset watermarks
+    cppkafka::TopicPartitionList topicPartitions;
     cppkafka::CallbackInvoker<Callbacks::RebalanceCallback>
         ("rebalance", topicEntry._configuration.getRebalanceCallback(), topicEntry._consumer.get())
-            (makeMetadata(topicEntry), error, partitions);
+            (makeMetadata(topicEntry), error, topicPartitions);
 }
 
 void ConsumerManagerImpl::adjustThrottling(ConsumerTopicEntry& topicEntry,
@@ -720,7 +788,7 @@ void ConsumerManagerImpl::adjustThrottling(ConsumerTopicEntry& topicEntry,
 void ConsumerManagerImpl::report(
                     ConsumerTopicEntry& topicEntry,
                     cppkafka::LogLevel level,
-                    int error,
+                    cppkafka::Error error,
                     const std::string& reason,
                     const cppkafka::Message* message)
 {
@@ -732,17 +800,7 @@ void ConsumerManagerImpl::report(
     }
 }
 
-void ConsumerManagerImpl::setConsumerBatchSize(size_t size)
-{
-    _batchSize = size;
-}
-
-size_t ConsumerManagerImpl::getConsumerBatchSize() const
-{
-    return _batchSize;
-}
-
-std::vector<cppkafka::Message> ConsumerManagerImpl::messageBatchReceiveTask(ConsumerTopicEntry& entry)
+MessageBatch ConsumerManagerImpl::messageBatchReceiveTask(ConsumerTopicEntry& entry)
 {
     try {
         if (entry._pollTimeout.count() == (int)TimerValues::Disabled) {
@@ -764,16 +822,30 @@ int ConsumerManagerImpl::messageRoundRobinReceiveTask(quantum::ThreadPromise<Mes
     try {
         int batchSize = entry._batchSize;
         std::chrono::milliseconds timeout = (entry._pollTimeout.count() == (int)TimerValues::Disabled) ?
-                                             entry._consumer->get_timeout() : entry._pollTimeout;
-        std::chrono::milliseconds timeoutPerRound = std::max(timeout/(int64_t)entry._batchSize,
-                                                             entry._roundRobinMinPollTimeout);
-        while (batchSize--) {
-            if (!entry._isSubscribed) {
+                                             entry._consumer->get_timeout() :
+                                             entry._pollTimeout;
+        std::chrono::milliseconds timeoutPerRound = (timeout.count() == (int)TimerValues::Unlimited) ?
+                                                    entry._minRoundRobinPollTimeout :
+                                                    std::max(timeout/(int64_t)entry._batchSize,
+                                                             entry._minRoundRobinPollTimeout);
+        auto endTime = std::chrono::steady_clock::now() + timeout;
+        
+        //Get messages
+        while (batchSize &&
+               ((timeout.count() == (int)TimerValues::Unlimited) ||
+               (std::chrono::steady_clock::now() < endTime))) {
+            if (entry._shuttingDown) {
+                //Exit early
                 break;
             }
-            cppkafka::Message message = entry._roundRobin->poll(timeoutPerRound);
+            cppkafka::Message message = entry._roundRobinStrategy->poll(std::chrono::milliseconds::zero());
             if (message) {
+                --batchSize;
+                //We have a valid message
                 promise->push(std::move(message));
+            }
+            else {
+                std::this_thread::sleep_for(timeoutPerRound);
             }
         }
     }
@@ -783,17 +855,11 @@ int ConsumerManagerImpl::messageRoundRobinReceiveTask(quantum::ThreadPromise<Mes
     return promise->closeBuffer();
 }
 
-ConsumerManagerImpl::DeserializedMessage
+DeserializedMessage
 ConsumerManagerImpl::deserializeMessage(ConsumerTopicEntry& entry,
                                         const cppkafka::Message& kafkaMessage)
 {
     DeserializerError de;
-    if (kafkaMessage.get_error()) {
-        de._error = kafkaMessage.get_error();
-        de._source |= (uint8_t)DeserializerError::Source::Kafka;
-        return DeserializedMessage(boost::any(), boost::any(), HeaderPack{}, de);
-    }
-    
     const TypeErasedDeserializer& deserializer = entry._configuration.getTypeErasedDeserializer();
     
     //Get the topic partition
@@ -836,7 +902,7 @@ ConsumerManagerImpl::deserializeMessage(ConsumerTopicEntry& entry,
         }
         catch (const std::exception& ex) {
             if (entry._skipUnknownHeaders) {
-                report(entry, cppkafka::LogLevel::LogWarning, 0, ex.what(), &kafkaMessage);
+                report(entry, cppkafka::LogLevel::LogWarning, {}, ex.what(), &kafkaMessage);
                 continue;
             }
             de._error = RD_KAFKA_RESP_ERR__NOT_IMPLEMENTED;
@@ -863,245 +929,107 @@ ConsumerManagerImpl::deserializeMessage(ConsumerTopicEntry& entry,
     return DeserializedMessage(std::move(key), std::move(payload), std::move(headers), de);
 }
 
-ConsumerManagerImpl::DeserializedMessage
-ConsumerManagerImpl::deserializeCoro(quantum::VoidContextPtr ctx,
-                                     ConsumerTopicEntry& entry,
-                                     const cppkafka::Message& kafkaMessage)
-{
-    bool skip = false;
-    if (entry._preprocessorCallback && entry._preprocess) {
-        if (entry._preprocessorThread == ThreadType::IO) {
-            // Call the preprocessor callback
-            skip = ctx->template postAsyncIo(preprocessorTask, entry, kafkaMessage)->get(ctx);
-        }
-        else {
-            //run in this coroutine
-            skip = entry._preprocessorCallback(cppkafka::TopicPartition(kafkaMessage.get_topic(),
-                                               kafkaMessage.get_partition(),
-                                               kafkaMessage.get_offset()));
-        }
-        if (skip) {
-            //return immediately and skip de-serializing
-            DeserializedMessage dm;
-            std::get<3>(dm)._error = RD_KAFKA_RESP_ERR__BAD_MSG;
-            std::get<3>(dm)._source |= (uint8_t)DeserializerError::Source::Preprocessor;
-            return dm;
-        }
-    }
-    // Deserialize the message
-    return deserializeMessage(entry, kafkaMessage);
-}
-
-std::vector<bool> ConsumerManagerImpl::executePreprocessorCallbacks(
-                                              quantum::VoidContextPtr ctx,
-                                              ConsumerTopicEntry& entry,
-                                              const std::vector<cppkafka::Message>& messages)
-{
-    // Preprocessor IO threads
-    const size_t callbackThreadRangeSize = entry._receiveCallbackThreadRange.second -
-                                           entry._receiveCallbackThreadRange.first + 1;
-    int numPerBatch = messages.size()/callbackThreadRangeSize;
-    int remainder = messages.size()%callbackThreadRangeSize;
-    std::vector<bool> skipMessages(messages.size(), false);
-    std::vector<quantum::CoroFuturePtr<int>> futures;
-    futures.reserve(callbackThreadRangeSize);
-    auto inputIt = messages.cbegin();
-    size_t batchIndex = 0;
-    
-    // Run the preprocessor callbacks in batches
-    for (int i = 0; i < (int)callbackThreadRangeSize; ++i) {
-        //get the begin and end iterators for each batch
-        size_t batchSize = (i < remainder) ? numPerBatch + 1 : numPerBatch;
-        if (batchSize == 0) {
-            break; //nothing to do
-        }
-        int ioQueueId = i + entry._receiveCallbackThreadRange.first;
-        futures.emplace_back(ctx->postAsyncIo(ioQueueId, false,
-            [&entry, &skipMessages, batchIndex, batchSize, inputIt]() mutable ->int
-        {
-            for (size_t j = batchIndex;
-                 j < (batchIndex + batchSize) && entry._preprocess;
-                 ++j, ++inputIt) {
-                if (!inputIt->get_error()) {
-                    skipMessages[j] = entry._preprocessorCallback(cppkafka::TopicPartition(inputIt->get_topic(),
-                                                                                           inputIt->get_partition(),
-                                                                                           inputIt->get_offset()));
-                }
-            }
-            return 0;
-        }));
-        // Advance index and iterator
-        batchIndex += batchSize;
-        std::advance(inputIt, batchSize);
-    }
-    
-    //Wait on preprocessor stage to finish
-    for (auto&& f : futures) {
-        f->wait(ctx);
-    }
-    return skipMessages;
-}
-
-std::vector<ConsumerManagerImpl::DeserializedMessage>
-ConsumerManagerImpl::deserializeBatchCoro(quantum::VoidContextPtr ctx,
-                                          ConsumerTopicEntry& entry,
-                                          const std::vector<cppkafka::Message>& messages)
-{
-    std::vector<bool> skipMessages;
-    if (entry._configuration.getPreprocessorCallback() && entry._preprocess) {
-        if (entry._preprocessorThread == ThreadType::IO) {
-            skipMessages = executePreprocessorCallbacks(ctx, entry, messages);
-        }
-        else {
-            skipMessages.resize(messages.size(), false);
-        }
-    }
-    
-    // Reset values
-    size_t numCoros = entry._coroQueueIdRangeForAny.second - entry._coroQueueIdRangeForAny.first + 1;
-    int numPerBatch = messages.size()/numCoros;
-    int remainder = messages.size()%numCoros;
-    std::vector<DeserializedMessage> deserializedMessages(messages.size()); //pre-allocate default constructed messages
-    std::vector<quantum::CoroContextPtr<int>> futures;
-    futures.reserve(numCoros);
-    auto inputIt = messages.cbegin();
-    size_t batchIndex = 0;
-    
-    // Post unto all the coroutine threads.
-    for (int h = 0, i = entry._coroQueueIdRangeForAny.first; i <= entry._coroQueueIdRangeForAny.second; ++i, ++h) {
-        //get the begin and end iterators for each batch
-        size_t batchSize = (h < remainder) ? numPerBatch + 1 : numPerBatch;
-        if (batchSize == 0) {
-            break; //nothing to do
-        }
-        futures.emplace_back(ctx->post(i, false,
-            [&entry, &deserializedMessages, &skipMessages, inputIt, batchIndex, batchSize]
-            (quantum::CoroContextPtr<int>) mutable ->int
-        {
-            for (size_t j = batchIndex; j < (batchIndex + batchSize); ++j, ++inputIt) {
-                if (entry._configuration.getPreprocessorCallback() &&
-                    entry._preprocess &&
-                    (entry._preprocessorThread == ThreadType::Coro) &&
-                    !inputIt->get_error()) {
-                    // Run the preprocessor on the coroutine thread
-                    skipMessages[j] = entry._preprocessorCallback(cppkafka::TopicPartition(inputIt->get_topic(),
-                                                                  inputIt->get_partition(),
-                                                                  inputIt->get_offset()));
-                }
-                if (!skipMessages.empty() && skipMessages[j]) {
-                    // Set error and mark source as preprocessor
-                    std::get<3>(deserializedMessages[j])._error = RD_KAFKA_RESP_ERR__BAD_MSG;
-                    std::get<3>(deserializedMessages[j])._source |= (uint8_t)DeserializerError::Source::Preprocessor;
-                }
-                else {
-                    // Deserialize message
-                    deserializedMessages[j] = deserializeMessage(entry, *inputIt);
-                }
-            }
-            return 0;
-        }));
-        // Advance index and iterator
-        batchIndex += batchSize;
-        std::advance(inputIt, batchSize);
-    }
-    
-    //Wait on deserialize stage to finish
-    for (auto&& f : futures) {
-        f->wait(ctx);
-    }
-    return deserializedMessages;
-}
-
 int ConsumerManagerImpl::invokeReceiver(ConsumerTopicEntry& entry,
-                                        cppkafka::Message&& kafkaMessage,
-                                        DeserializedMessage&& deserializedMessage)
+                                        cppkafka::Message&& kafkaMessage)
 {
+    DeserializedMessage deserializedMessage;
+    //pre-process message
+    if (entry._preprocess &&
+        entry._preprocessorCallback &&
+        !kafkaMessage.is_eof() &&
+        !entry._preprocessorCallback(kafkaMessage)) {
+        std::get<(int)Field::Error>(deserializedMessage)._source |= (uint8_t)DeserializerError::Source::Preprocessor;
+    }
+    //check errors (if any)
+    if (kafkaMessage.get_error()) {
+        std::get<(int)Field::Error>(deserializedMessage)._error = kafkaMessage.get_error();
+        std::get<(int)Field::Error>(deserializedMessage)._source |= (uint8_t)DeserializerError::Source::Kafka;
+    }
+    //deserialize
+    if (std::get<(int)Field::Error>(deserializedMessage)._source == 0) {
+        //no errors were detected
+        deserializedMessage = deserializeMessage(entry, kafkaMessage);
+    }
+    //call receiver callback
+    entry._enableWatermarkCheck = true;
     cppkafka::CallbackInvoker<Receiver>("receiver", entry._configuration.getTypeErasedReceiver(), entry._consumer.get())
           (*entry._committer,
            entry._offsets,
            std::move(kafkaMessage), //kafka raw message
-           std::get<0>(std::move(deserializedMessage)), //key
-           std::get<1>(std::move(deserializedMessage)), //payload
-           std::get<2>(std::move(deserializedMessage)), //headers
-           std::get<3>(std::move(deserializedMessage)), //error
+           std::get<(int)Field::Key>(std::move(deserializedMessage)), //key
+           std::get<(int)Field::Payload>(std::move(deserializedMessage)), //payload
+           std::get<(int)Field::Headers>(std::move(deserializedMessage)), //headers
+           std::get<(int)Field::Error>(std::move(deserializedMessage)), //error
            makeOffsetPersistSettings(entry));
-    return 0;
+    return (std::get<(int)Field::Error>(deserializedMessage)._source == 0) ? 0 : -1;
 }
 
-int ConsumerManagerImpl::receiverTask(ConsumerTopicEntry& entry,
-                                      cppkafka::Message&& kafkaMessage,
-                                      DeserializedMessage&& deserializedMessage)
-{
-    return invokeReceiver(entry, std::move(kafkaMessage), std::move(deserializedMessage));
-}
-
-std::deque<ConsumerManagerImpl::MessageTuple>
+int
 ConsumerManagerImpl::pollCoro(quantum::VoidContextPtr ctx,
                               ConsumerTopicEntry& entry)
 {
-    std::deque<MessageTuple> messageQueue;
     try {
         // Start the IO task to get messages in a round-robin way
-        quantum::CoroFuture<MessageContainer>::Ptr future = ctx->postAsyncIo(
-            (int)quantum::IQueue::QueueId::Any, true, messageRoundRobinReceiveTask, entry);
+        quantum::CoroFuture<MessageContainer>::Ptr future =
+            ctx->postAsyncIo((int)entry._pollIoThreadId, true, messageRoundRobinReceiveTask, entry);
             
         // Receive all messages from kafka and deserialize in parallel
         bool isBufferClosed = false;
         while (!isBufferClosed) {
             cppkafka::Message message = future->pull(ctx, isBufferClosed);
             if (!isBufferClosed) {
-                messageQueue.emplace_back(MessageTuple(std::move(message), nullptr));
-                MessageTuple& tuple = messageQueue.back();
-                if (!std::get<0>(tuple).get_error()) { // check if message has any errors
-                    std::get<1>(tuple) = ctx->post(deserializeCoro, entry, std::get<0>(tuple));
-                }
+                //deliver to application
+                processMessage(ctx, entry, std::move(message));
             }
         }
     }
     catch (const std::exception& ex) {
         exceptionHandler(ex, entry);
+        return -1;
     }
     // Pass the message queue to the processor coroutine
-    return messageQueue;
+    return 0;
 }
 
-void ConsumerManagerImpl::processMessageBatchOnIoThreads(quantum::VoidContextPtr ctx,
-                                                         ConsumerTopicEntry& entry,
-                                                         std::vector<cppkafka::Message>&& raw,
-                                                         std::vector<DeserializedMessage>&& deserializedMessages)
+void ConsumerManagerImpl::processMessageBatch(quantum::VoidContextPtr ctx,
+                                              ConsumerTopicEntry& entry,
+                                              MessageBatch&& kafkaMessages)
 {
+    if (kafkaMessages.empty()) {
+        return; //nothing to do
+    }
     const std::pair<int,int>& threadRange = entry._receiveCallbackThreadRange;
-    const int callbackThreadRangeSize = threadRange.second - threadRange.first + 1;
-    if (callbackThreadRangeSize > 1) {
-        // split the messages into io queues
-        std::vector<ReceivedBatch> partitions(callbackThreadRangeSize);
-        size_t rawIx = 0;
-        for (auto&& deserializedMessage : deserializedMessages) {
-            cppkafka::Message& rawMessage = raw[rawIx++];
-            if (rawIx > raw.size()) {
-                throw ConsumerException(entry._configuration._topic, "Invalid message index");
-            }
-            // Find out on which IO thread we should process this message
-            const int ioQueue = mapPartitionToQueue(rawMessage.get_partition(), threadRange);
-            partitions[ioQueue - threadRange.first]
-                .emplace_back(std::make_tuple(std::move(rawMessage), std::move(deserializedMessage)));
+    const int numThreads = threadRange.second - threadRange.first + 1;
+    
+    if (numThreads > 1) {
+        Batches receiverBatches(numThreads);
+        //reserve enough space
+        for (auto& batch : receiverBatches) {
+            //we reserve conservatively
+            batch.reserve((kafkaMessages.size()/numThreads)*numThreads/2);
         }
-        if (rawIx != raw.size()) {
-            throw ConsumerException(entry._configuration._topic, "Not all messages were processed");
+        //distribute batches to be invoked on separate IO threads
+        for (auto&& message : kafkaMessages) {
+            int ioQueue = mapPartitionToQueue(message.get_partition(), entry._receiveCallbackThreadRange);
+            receiverBatches[ioQueue].emplace_back(std::move(message));
         }
         // invoke batch jobs for the partitioned messages
         std::vector<quantum::ICoroFuture<int>::Ptr> ioFutures;
-        ioFutures.reserve(partitions.size());
-        for (size_t queueIx = 0; queueIx < partitions.size(); ++queueIx) {
-            const int ioQueue = queueIx + threadRange.first;
-            quantum::ICoroFuture<int>::Ptr future =
-                ctx->postAsyncIo(ioQueue,
-                                  false,
-                                  receiverMultipleBatchesTask,
-                                  entry,
-                                  std::move(partitions[queueIx]));
-            if (entry._receiveCallbackExec == ExecMode::Sync) {
-                ioFutures.push_back(future);
+        if (entry._receiveCallbackExec == ExecMode::Sync) {
+            ioFutures.reserve(numThreads);
+        }
+        for (int queueId = threadRange.first; queueId <= threadRange.second; ++queueId) {
+            int threadId = queueId - threadRange.first;
+            if (!receiverBatches[threadId].empty()) {
+                quantum::ICoroFuture<int>::Ptr future =
+                    ctx->postAsyncIo(queueId,
+                                     false,
+                                     receiveMessageBatch,
+                                     entry,
+                                     std::move(receiverBatches[threadId]));
+                if (entry._receiveCallbackExec == ExecMode::Sync) {
+                    ioFutures.push_back(future);
+                }
             }
         }
         // wait until all the batches are processed
@@ -1110,16 +1038,21 @@ void ConsumerManagerImpl::processMessageBatchOnIoThreads(quantum::VoidContextPtr
         }
     }
     else {
-        // optimization: no need to spend time on message distribution for a single io queue
-        quantum::ICoroFuture<int>::Ptr future =
-            ctx->postAsyncIo(threadRange.first,
-                              false,
-                              receiverSingleBatchTask,
-                              entry,
-                              std::move(raw),
-                              std::move(deserializedMessages));
-        if (entry._receiveCallbackExec == ExecMode::Sync) {
-            future->get(ctx);
+        if (entry._receiverThread == ThreadType::IO) {
+            // optimization: no need to spend time on message distribution for a single io queue
+            quantum::ICoroFuture<int>::Ptr future =
+                ctx->postAsyncIo(threadRange.first,
+                                  false,
+                                  receiveMessageBatch,
+                                  entry,
+                                  std::move(kafkaMessages));
+            if (entry._receiveCallbackExec == ExecMode::Sync) {
+                future->get(ctx);
+            }
+        }
+        else {
+            //call directly on this coroutine
+            receiveMessageBatch(entry, std::move(kafkaMessages));
         }
     }
 }
@@ -1127,38 +1060,27 @@ void ConsumerManagerImpl::processMessageBatchOnIoThreads(quantum::VoidContextPtr
 int ConsumerManagerImpl::pollBatchCoro(quantum::VoidContextPtr ctx,
                                        ConsumerTopicEntry& entry)
 {
-    try{
-        // get the messages from the prefetched future, or
-        std::vector<cppkafka::Message> raw;
+    try {
+        // get the messages from the pre-fetched future, or
+        MessageBatch raw;
         if (entry._batchPrefetch)
         {
-            if (entry._messagePrefetchFuture) {
+            if (entry._batchPrefetchFuture) {
                 //get the pre-fetched batch
-                raw = entry._messagePrefetchFuture->get(ctx);
+                raw = entry._batchPrefetchFuture->get(ctx);
             }
             // start pre-fetching for the next batch
-            entry._messagePrefetchFuture = ctx->postAsyncIo
-                ((int)quantum::IQueue::QueueId::Any, true, messageBatchReceiveTask, entry);
+            entry._batchPrefetchFuture = ctx->postAsyncIo
+                ((int)entry._pollIoThreadId, true, messageBatchReceiveTask, entry);
         }
         else {
-            raw = ctx->postAsyncIo((int)quantum::IQueue::QueueId::Any,
+            raw = ctx->postAsyncIo((int)entry._pollIoThreadId,
                                    true,
                                    messageBatchReceiveTask,
                                    entry)->get(ctx);
         }
-        
-        if (!raw.empty()) {
-            // process messages
-            std::vector<DeserializedMessage> deserializedMessages = ctx->post(deserializeBatchCoro, entry, raw)
-                                                                       ->get(ctx);
-    
-            if (entry._receiverThread == ThreadType::IO) {
-                processMessageBatchOnIoThreads(ctx, entry, std::move(raw), std::move(deserializedMessages));
-            }
-            else {
-                invokeSingleBatchReceiver(entry, std::move(raw), std::move(deserializedMessages));
-            }
-        }
+        // process messages
+        processMessageBatch(ctx, entry, std::move(raw));
         return 0;
     }
     catch (const std::exception& ex) {
@@ -1166,101 +1088,39 @@ int ConsumerManagerImpl::pollBatchCoro(quantum::VoidContextPtr ctx,
         return -1;
     }
 }
-                                  
-int ConsumerManagerImpl::receiverMultipleBatchesTask(ConsumerTopicEntry& entry,
-                                                     ReceivedBatch&& messageBatch)
+
+int ConsumerManagerImpl::receiveMessageBatch(ConsumerTopicEntry& entry,
+                                             MessageBatch&& kafkaMessages)
 {
-    for (auto&& messageTuple : messageBatch) {
-        cppkafka::CallbackInvoker<Receiver>("receiver", entry._configuration.getTypeErasedReceiver(), entry._consumer.get())
-            (*entry._committer,
-             entry._offsets,
-             std::get<0>(std::move(messageTuple)), //kafka raw message
-             std::get<0>(std::get<1>(std::move(messageTuple))), //key
-             std::get<1>(std::get<1>(std::move(messageTuple))), //payload
-             std::get<2>(std::get<1>(std::move(messageTuple))), //headers
-             std::get<3>(std::get<1>(std::move(messageTuple))), //error
-             makeOffsetPersistSettings(entry));
+    for (auto&& message : kafkaMessages) {
+        invokeReceiver(entry, std::move(message));
     }
-    return 0;
 }
 
-int ConsumerManagerImpl::invokeSingleBatchReceiver(ConsumerTopicEntry& entry,
-                                                   std::vector<cppkafka::Message>&& rawMessages,
-                                                   std::vector<DeserializedMessage>&& deserializedMessages)
+int ConsumerManagerImpl::processMessage(quantum::VoidContextPtr ctx,
+                                        ConsumerTopicEntry& entry,
+                                        cppkafka::Message&& kafkaMessage)
 {
-    size_t rawIx = 0;
-    for (auto&& deserializedMessage : deserializedMessages) {
-        cppkafka::Message& rawMessage = rawMessages[rawIx++];
-        if (rawIx > rawMessages.size()) {
-            throw ConsumerException(entry._configuration._topic, "Invalid message index");
-        }
-        cppkafka::CallbackInvoker<Receiver>("receiver", entry._configuration.getTypeErasedReceiver(), entry._consumer.get())
-            (*entry._committer,
-             entry._offsets,
-             std::move(rawMessage), //kafka raw message
-             std::get<0>(std::move(deserializedMessage)), //key
-             std::get<1>(std::move(deserializedMessage)), //payload
-             std::get<2>(std::move(deserializedMessage)), //headers
-             std::get<3>(std::move(deserializedMessage)), //error
-             makeOffsetPersistSettings(entry));
-    }
-    if (rawIx != rawMessages.size()) {
-        throw ConsumerException(entry._configuration._topic, "Not all messages were processed");
-    }
-    return 0;
-}
-
-int ConsumerManagerImpl::receiverSingleBatchTask(ConsumerTopicEntry& entry,
-                                                 std::vector<cppkafka::Message>&& rawMessages,
-                                                 std::vector<DeserializedMessage>&& deserializedMessages)
-{
-    return invokeSingleBatchReceiver(entry, std::move(rawMessages), std::move(deserializedMessages));
-}
-
-bool ConsumerManagerImpl::preprocessorTask(ConsumerTopicEntry& entry,
-                                           const cppkafka::Message& kafkaMessage)
-{
-    return entry._preprocessorCallback(cppkafka::TopicPartition(kafkaMessage.get_topic(),
-                                       kafkaMessage.get_partition(),
-                                       kafkaMessage.get_offset()));
-}
-
-int ConsumerManagerImpl::processorCoro(quantum::VoidContextPtr ctx,
-                                       ConsumerTopicEntry& entry)
-{
-    //Get the polled messages from the previous stage (non-blocking)
-    std::deque<MessageTuple> messageQueue = ctx->getPrev<std::deque<MessageTuple>>();
-    
-    // Enqueue all messages and wait for completion
-    for (auto& messageTuple : messageQueue) {
-        try {
-            auto &message = std::get<0>(messageTuple);
-            auto deserializedFuture = std::get<1>(messageTuple);
-            if (entry._receiverThread == ThreadType::IO) {
-                // Find out on which IO thread we should process this message
-                int ioQueue = mapPartitionToQueue(message.get_partition(), entry._receiveCallbackThreadRange);
-                // Post and wait until delivered
-                quantum::ICoroFuture<int>::Ptr future =
-                    ctx->postAsyncIo(ioQueue,
-                                     false,
-                                     receiverTask,
-                                     entry,
-                                     std::move(message),
-                                     deserializedFuture ? deserializedFuture->get(ctx) : DeserializedMessage());
-                if (entry._receiveCallbackExec == ExecMode::Sync) {
-                    future->get(ctx);
-                }
-            }
-            else {
-                //call serially on this coroutine
-                invokeReceiver(entry,
-                               std::move(message),
-                               deserializedFuture ? deserializedFuture->get(ctx) : DeserializedMessage());
+    try {
+        if (entry._receiverThread == ThreadType::IO) {
+            // Find out on which IO thread we should process this message
+            int ioQueue = mapPartitionToQueue(kafkaMessage.get_partition(), entry._receiveCallbackThreadRange);
+            
+            // Post and wait until delivered
+            quantum::ICoroFuture<int>::Ptr future =
+                ctx->postAsyncIo(ioQueue, false, invokeReceiver, entry, std::move(kafkaMessage));
+            if (entry._receiveCallbackExec == ExecMode::Sync) {
+                future->get(ctx);
             }
         }
-        catch (const std::exception& ex) {
-            exceptionHandler(ex, entry);
+        else {
+            //call serially on this coroutine
+            invokeReceiver(entry, std::move(kafkaMessage));
         }
+    }
+    catch (const std::exception& ex) {
+        exceptionHandler(ex, entry);
+        return -1;
     }
     return 0;
 }
@@ -1310,6 +1170,30 @@ ConsumerManagerImpl::findConsumer(const std::string& topic) const
         throw TopicException(topic, "Not found");
     }
     return it;
+}
+
+bool ConsumerManagerImpl::hasNewMessages(ConsumerTopicEntry& entry) const
+{
+    if (!entry._enableWatermarkCheck) {
+        return true;
+    }
+    Metadata::OffsetWatermarkList watermarks = makeMetadata(entry).getOffsetWatermarks();
+    if (entry._watermarks.empty()) {
+        //update watermarks
+        entry._watermarks = watermarks;
+        return true;
+    }
+    bool hasNew = false;
+    for (size_t i = 0; i < watermarks.size(); ++i) {
+        if (watermarks[i]._watermark._high < 0) continue;
+        if (watermarks[i]._watermark._high > entry._watermarks[i]._watermark._high) {
+            hasNew = true;
+            //update watermarks
+            entry._watermarks = watermarks;
+            break;
+        }
+    }
+    return hasNew;
 }
 
 }

@@ -61,7 +61,7 @@ public:
      *       shall be used with offsets set to RD_KAFKA_OFFSET_STORED.
      */
     void subscribe(const std::string& topic,
-                   cppkafka::TopicPartitionList partitionList = {});
+                   const cppkafka::TopicPartitionList& partitionList = {});
     
     /**
      * @brief Unsubscribe from this topic.
@@ -145,6 +145,8 @@ protected:
     virtual ~ConsumerManager();
     
     void poll();
+    
+    void pollEnd();
     
 private:
     std::unique_ptr<ConsumerManagerImpl>  _impl;
